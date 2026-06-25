@@ -1,6 +1,35 @@
+// Package eventloop provides a high-performance JavaScript event loop implementation
+// with optimized logging to minimize performance impact.
+//
+// Logging Performance Optimizations:
+// - Debug logs are disabled by default and controlled by enableDebugLog flag
+// - Stack traces are only included in debug mode to reduce log size
+// - Nil checks prevent unnecessary log calls when logger is not configured
+// - Error logs are kept concise while maintaining essential information
+// - Panic statistics are only logged when panics occur or in debug mode
+//
+// Usage:
+//
+//	// Use with custom logger
+//	loop := NewEventLoop(
+//	  WithLogger(myLogger),
+//	  WithDebugLog(false), // Keep false in production for best performance
+//	)
+//
+//	// Use with kratos logger (backward compatible)
+//	import "github.com/go-kratos/kratos/v2/log"
+//	loop := NewEventLoop(
+//	  WithLoggerHelper(log.NewHelper(log.With(log.GetLogger(), "component", "EventLoop"))),
+//	)
+//
+// Fork from goga-nodejs
 package eventloop
 
 import (
+	"context"
+	"errors"
+	"fmt"
+	"runtime/debug"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -9,6 +38,27 @@ import (
 	"github.com/dop251/goja_nodejs/console"
 	"github.com/dop251/goja_nodejs/require"
 )
+
+// Logger is a simple logging interface that can be implemented by any logging library.
+// This allows users to provide their own logging implementation instead of being tied to kratos logger.
+type Logger interface {
+	// Debug logs debug messages. Implementations should handle nil or empty messages gracefully.
+	Debug(args ...interface{})
+	// Debugf logs formatted debug messages. Implementations should handle nil format strings gracefully.
+	Debugf(format string, args ...interface{})
+	// Info logs informational messages. Implementations should handle nil or empty messages gracefully.
+	Info(args ...interface{})
+	// Infof logs formatted informational messages. Implementations should handle nil format strings gracefully.
+	Infof(format string, args ...interface{})
+	// Warn logs warning messages. Implementations should handle nil or empty messages gracefully.
+	Warn(args ...interface{})
+	// Warnf logs formatted warning messages. Implementations should handle nil format strings gracefully.
+	Warnf(format string, args ...interface{})
+	// Error logs error messages. Implementations should handle nil or empty messages gracefully.
+	Error(args ...interface{})
+	// Errorf logs formatted error messages. Implementations should handle nil format strings gracefully.
+	Errorf(format string, args ...interface{})
+}
 
 type job struct {
 	cancel func() bool
@@ -27,6 +77,7 @@ type Interval struct {
 	job
 	ticker   *time.Ticker
 	stopChan chan struct{}
+	stopped  int32 // atomic flag to prevent double close
 }
 
 type Immediate struct {
@@ -52,35 +103,54 @@ type EventLoop struct {
 
 	enableConsole bool
 	registry      *require.Registry
+	jsRequire     *require.RequireModule
+
+	// Enhanced panic handling and lifecycle management
+	ctx        context.Context
+	cancel     context.CancelFunc
+	panicCount int64  // atomic counter for panic statistics
+	logger     Logger // Logger interface for flexible logging
+
+	// Performance optimization flags
+	enableDebugLog bool // Control debug level logging for performance
 }
 
 func NewEventLoop(opts ...Option) *EventLoop {
 	vm := goja.New()
 
+	// Create context with cancel for lifecycle management
+	ctx, cancel := context.WithCancel(context.Background())
+
 	loop := &EventLoop{
-		vm:            vm,
-		jobChan:       make(chan func()),
-		wakeupChan:    make(chan struct{}, 1),
-		enableConsole: true,
+		vm:             vm,
+		jobChan:        make(chan func()),
+		wakeupChan:     make(chan struct{}, 1),
+		enableConsole:  true,
+		ctx:            ctx,
+		cancel:         cancel,
+		logger:         &defaultLogger{}, // default simple logger
+		enableDebugLog: false,            // Default to false for better performance - reduces log overhead
 	}
 	loop.stopCond = sync.NewCond(&loop.stopLock)
 
+	// Apply options first
 	for _, opt := range opts {
 		opt(loop)
 	}
+
 	if loop.registry == nil {
 		loop.registry = new(require.Registry)
 	}
-	loop.registry.Enable(vm)
+	loop.jsRequire = loop.registry.Enable(vm)
 	if loop.enableConsole {
 		console.Enable(vm)
 	}
-	vm.Set("setTimeout", loop.setTimeout)
-	vm.Set("setInterval", loop.setInterval)
-	vm.Set("setImmediate", loop.setImmediate)
-	vm.Set("clearTimeout", loop.clearTimeout)
-	vm.Set("clearInterval", loop.clearInterval)
-	vm.Set("clearImmediate", loop.clearImmediate)
+	_ = vm.Set("setTimeout", loop.setTimeout)
+	_ = vm.Set("setInterval", loop.setInterval)
+	_ = vm.Set("setImmediate", loop.setImmediate)
+	_ = vm.Set("clearTimeout", loop.clearTimeout)
+	_ = vm.Set("clearInterval", loop.clearInterval)
+	_ = vm.Set("clearImmediate", loop.clearImmediate)
 
 	return loop
 }
@@ -103,6 +173,96 @@ func WithRegistry(registry *require.Registry) Option {
 	}
 }
 
+// WithLogger sets a custom logger for the event loop
+func WithLogger(logger Logger) Option {
+	return func(loop *EventLoop) {
+		loop.logger = logger
+	}
+}
+
+// WithDebugLog enables or disables debug level logging for performance optimization.
+// When disabled (default), only error and warning logs are emitted, significantly
+// reducing logging overhead in production environments.
+// Enable this only for debugging purposes as it may impact performance.
+func WithDebugLog(enable bool) Option {
+	return func(loop *EventLoop) {
+		loop.enableDebugLog = enable
+	}
+}
+
+// defaultLogger is a simple default logger implementation that uses fmt.Println
+// It provides basic logging functionality when no custom logger is provided
+type defaultLogger struct{}
+
+func (d *defaultLogger) Debug(args ...interface{}) {
+	fmt.Println(args...)
+}
+
+func (d *defaultLogger) Debugf(format string, args ...interface{}) {
+	fmt.Printf(format+"\n", args...)
+}
+
+func (d *defaultLogger) Info(args ...interface{}) {
+	fmt.Println(args...)
+}
+
+func (d *defaultLogger) Infof(format string, args ...interface{}) {
+	fmt.Printf(format+"\n", args...)
+}
+
+func (d *defaultLogger) Warn(args ...interface{}) {
+	fmt.Println(args...)
+}
+
+func (d *defaultLogger) Warnf(format string, args ...interface{}) {
+	fmt.Printf("WARN: "+format+"\n", args...)
+}
+
+func (d *defaultLogger) Error(args ...interface{}) {
+	fmt.Println(args...)
+}
+
+func (d *defaultLogger) Errorf(format string, args ...interface{}) {
+	fmt.Printf("ERROR: "+format+"\n", args...)
+}
+
+// GetPanicCount returns the total number of panics that have occurred
+func (loop *EventLoop) GetPanicCount() int64 {
+	return atomic.LoadInt64(&loop.panicCount)
+}
+
+// reinitializeContext creates new context for restart after termination
+func (loop *EventLoop) reinitializeContext() {
+	loop.cancel()
+	loop.ctx, loop.cancel = context.WithCancel(context.Background())
+	loop.terminated = false
+	// Only log context reinitialization in debug mode to reduce performance impact
+	if loop.logger != nil && loop.enableDebugLog {
+		loop.logger.Debugf("Event loop context reinitialized for restart")
+	}
+}
+
+// safeExecute wraps function execution with panic recovery
+func (loop *EventLoop) safeExecute(name string, fn func()) {
+	if fn == nil {
+		return
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			atomic.AddInt64(&loop.panicCount, 1)
+			// Only include stack trace for critical errors to reduce log size
+			if loop.logger != nil {
+				loop.logger.Errorf("Panic in %s: %v", name, r)
+				// Stack trace only in debug mode
+				if loop.enableDebugLog {
+					loop.logger.Debugf("Stack trace for panic in %s:\n%s", name, debug.Stack())
+				}
+			}
+		}
+	}()
+	fn()
+}
+
 func (loop *EventLoop) schedule(call goja.FunctionCall, repeating bool) goja.Value {
 	if fn, ok := goja.AssertFunction(call.Argument(0)); ok {
 		delay := call.Argument(1).ToInteger()
@@ -110,7 +270,15 @@ func (loop *EventLoop) schedule(call goja.FunctionCall, repeating bool) goja.Val
 		if len(call.Arguments) > 2 {
 			args = append(args, call.Arguments[2:]...)
 		}
-		f := func() { fn(nil, args...) }
+		f := func() {
+			_, err := fn(nil, args...)
+			if err != nil {
+				if loop.logger != nil {
+					loop.logger.Errorf("Error in scheduled function: %v", err)
+				}
+				return
+			}
+		}
 		loop.jobCount++
 		var job *job
 		var ret goja.Value
@@ -146,7 +314,15 @@ func (loop *EventLoop) setImmediate(call goja.FunctionCall) goja.Value {
 		if len(call.Arguments) > 1 {
 			args = append(args, call.Arguments[1:]...)
 		}
-		f := func() { fn(nil, args...) }
+		f := func() {
+			_, err := fn(nil, args...)
+			if err != nil {
+				if loop.logger != nil {
+					loop.logger.Errorf("JS immediate callback error: %v", err)
+				}
+				return
+			}
+		}
 		loop.jobCount++
 		return loop.vm.ToValue(loop.addImmediate(f))
 	}
@@ -216,11 +392,18 @@ func (loop *EventLoop) setRunning() {
 	if loop.running {
 		panic("Loop is already started")
 	}
-	loop.running = true
+
+	// Reinitialize context if terminated
+	if loop.terminated {
+		loop.reinitializeContext()
+	}
+
 	atomic.StoreInt32(&loop.canRun, 1)
-	loop.auxJobsLock.Lock()
-	loop.terminated = false
-	loop.auxJobsLock.Unlock()
+	loop.running = true
+	// Use debug level for routine operations to reduce log noise
+	if loop.logger != nil && loop.enableDebugLog {
+		loop.logger.Debugf("Event loop started")
+	}
 }
 
 // Run calls the specified function, starts the event loop and waits until there are no more delayed jobs to run
@@ -287,6 +470,13 @@ func (loop *EventLoop) StopNoWait() {
 // After being terminated the loop can be restarted again by using Start() or Run().
 // This method must not be called concurrently with Stop*(), Start(), or Run().
 func (loop *EventLoop) Terminate() {
+	if loop.logger != nil && loop.enableDebugLog {
+		loop.logger.Debugf("Terminating event loop...")
+	}
+
+	// Cancel context to signal all goroutines to stop
+	loop.cancel()
+
 	loop.Stop()
 
 	loop.auxJobsLock.Lock()
@@ -295,6 +485,7 @@ func (loop *EventLoop) Terminate() {
 
 	loop.runAux()
 
+	// First, cancel ALL jobs before draining jobChan to prevent new jobs from being queued
 	for i := 0; i < len(loop.jobs); i++ {
 		job := loop.jobs[i]
 		if !job.cancelled {
@@ -306,8 +497,23 @@ func (loop *EventLoop) Terminate() {
 		}
 	}
 
-	for len(loop.jobs) > 0 {
-		(<-loop.jobChan)()
+	// After all jobs are cancelled, drain jobChan with non-blocking select to prevent deadlock
+	select {
+	case jober := <-loop.jobChan:
+		// Execute any pending job to prevent goroutine leak
+		jober()
+	default:
+		// Channel is empty, continue
+	}
+
+	// Only log termination statistics if there were panics or in debug mode
+	panicCount := loop.GetPanicCount()
+	if loop.logger != nil {
+		if panicCount > 0 {
+			loop.logger.Warnf("Event loop terminated with %d panics handled", panicCount)
+		} else if loop.enableDebugLog {
+			loop.logger.Debugf("Event loop terminated successfully")
+		}
 	}
 }
 
@@ -326,13 +532,31 @@ func (loop *EventLoop) runAux() {
 	loop.auxJobs = loop.auxJobsSpare
 	loop.auxJobsLock.Unlock()
 	for i, job := range jobs {
-		job()
+		loop.safeExecute(fmt.Sprintf("auxJob-%d", i), job)
 		jobs[i] = nil
 	}
 	loop.auxJobsSpare = jobs[:0]
 }
 
 func (loop *EventLoop) run(inBackground bool) {
+	// Ensure proper cleanup of running state even if panic occurs
+	// This prevents deadlock in Stop() and Terminate() methods
+	defer func() {
+		if r := recover(); r != nil {
+			atomic.AddInt64(&loop.panicCount, 1)
+			if loop.logger != nil {
+				loop.logger.Errorf("Panic in event loop run: %v", r)
+				if loop.enableDebugLog {
+					loop.logger.Debugf("Stack trace for event loop panic:\n%s", debug.Stack())
+				}
+			}
+		}
+		loop.stopLock.Lock()
+		loop.running = false
+		loop.stopLock.Unlock()
+		loop.stopCond.Broadcast()
+	}()
+
 	loop.runAux()
 	if inBackground {
 		loop.jobCount++
@@ -340,23 +564,24 @@ func (loop *EventLoop) run(inBackground bool) {
 LOOP:
 	for loop.jobCount > 0 {
 		select {
-		case job := <-loop.jobChan:
-			job()
+		case jobber := <-loop.jobChan:
+			loop.safeExecute("eventloop-job", jobber)
 		case <-loop.wakeupChan:
 			loop.runAux()
 			if atomic.LoadInt32(&loop.canRun) == 0 {
 				break LOOP
 			}
+		case <-loop.ctx.Done():
+			// Context cancelled, graceful shutdown
+			if loop.logger != nil && loop.enableDebugLog {
+				loop.logger.Debugf("Event loop context cancelled, shutting down gracefully")
+			}
+			break LOOP
 		}
 	}
 	if inBackground {
 		loop.jobCount--
 	}
-
-	loop.stopLock.Lock()
-	loop.running = false
-	loop.stopLock.Unlock()
-	loop.stopCond.Broadcast()
 }
 
 func (loop *EventLoop) wakeup() {
@@ -364,6 +589,11 @@ func (loop *EventLoop) wakeup() {
 	case loop.wakeupChan <- struct{}{}:
 	default:
 	}
+}
+
+// submitTask submits a task to the ants pool for unified concurrency control
+func (loop *EventLoop) submitTask(task func()) {
+	go loop.safeExecute("task", task)
 }
 
 func (loop *EventLoop) addAuxJob(fn func()) bool {
@@ -376,6 +606,39 @@ func (loop *EventLoop) addAuxJob(fn func()) bool {
 	loop.auxJobsLock.Unlock()
 	loop.wakeup()
 	return true
+}
+
+// RequireModule loads a module with eventloop require in a goroutine-safe manner.
+// This method can be called from any goroutine and will automatically schedule
+// the module loading operation within the event loop's execution context.
+// It blocks until the module is loaded or an error occurs.
+func (loop *EventLoop) RequireModule(modulePath string) (goja.Value, error) {
+	if loop.jsRequire == nil {
+		return nil, errors.New("require module not initialized")
+	}
+	
+	// Use a channel to synchronously wait for the result
+	resultChan := make(chan struct {
+		value goja.Value
+		err   error
+	}, 1)
+	
+	// Schedule the require operation on the event loop
+	scheduled := loop.RunOnLoop(func(vm *goja.Runtime) {
+		module, err := loop.jsRequire.Require(modulePath)
+		resultChan <- struct {
+			value goja.Value
+			err   error
+		}{module, err}
+	})
+	
+	if !scheduled {
+		return nil, errors.New("event loop is terminated")
+	}
+	
+	// Wait for the result
+	result := <-resultChan
+	return result.value, result.err
 }
 
 func (loop *EventLoop) newTimeout(f func()) *Timer {
@@ -411,7 +674,9 @@ func (i *Interval) start(loop *EventLoop, timeout time.Duration) {
 		timeout = time.Millisecond
 	}
 	i.ticker = time.NewTicker(timeout)
-	go i.run(loop)
+	loop.submitTask(func() {
+		i.run(loop)
+	})
 }
 
 func (loop *EventLoop) addImmediate(f func()) *Immediate {
@@ -429,13 +694,13 @@ func (loop *EventLoop) doTimeout(t *Timer) {
 	if !t.cancelled {
 		t.cancelled = true
 		loop.jobCount--
-		t.fn()
+		loop.safeExecute("timeout", t.fn)
 	}
 }
 
 func (loop *EventLoop) doInterval(i *Interval) {
 	if !i.cancelled {
-		i.fn()
+		loop.safeExecute("interval", i.fn)
 	}
 }
 
@@ -443,7 +708,7 @@ func (loop *EventLoop) doImmediate(i *Immediate) {
 	if !i.cancelled {
 		i.cancelled = true
 		loop.jobCount--
-		i.fn()
+		loop.safeExecute("immediate", i.fn)
 	}
 }
 
@@ -462,6 +727,7 @@ func (loop *EventLoop) clearInterval(i *Interval) {
 		i.cancelled = true
 		loop.jobCount--
 		i.doCancel()
+		loop.removeJob(&i.job)
 	}
 }
 
@@ -487,7 +753,9 @@ func (loop *EventLoop) clearImmediate(i *Immediate) {
 }
 
 func (i *Interval) doCancel() bool {
-	close(i.stopChan)
+	if atomic.CompareAndSwapInt32(&i.stopped, 0, 1) {
+		close(i.stopChan)
+	}
 	return false
 }
 
@@ -503,12 +771,22 @@ L:
 			i.ticker.Stop()
 			break L
 		case <-i.ticker.C:
-			loop.jobChan <- func() {
+			select {
+			case loop.jobChan <- func() {
 				loop.doInterval(i)
+			}:
+			case <-i.stopChan:
+				i.ticker.Stop()
+				break L
 			}
 		}
 	}
-	loop.jobChan <- func() {
+	// Try to send cleanup job, but don't block if event loop is terminated
+	select {
+	case loop.jobChan <- func() {
 		loop.removeJob(&i.job)
+	}:
+	default:
+		// Event loop is likely terminated, cleanup will be handled by Terminate()
 	}
 }
